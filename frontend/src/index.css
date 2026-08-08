@@ -1,0 +1,126 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=Inter:wght@400;500;700&display=swap');
+
+:root {
+  /* REDLINE Brand Kit */
+  --bg: #0A0A0A;
+  --text: #F5F5F0;
+  --text-h: #F5F5F0;
+  --border: #F5F5F0;
+  --code-bg: #111111;
+  --signal-red: #FF2D2D;
+  --calm-green: #00C853;
+
+  /* Typography */
+  --sans: 'Inter', sans-serif;
+  --heading: 'Inter', sans-serif;
+  --mono: 'IBM Plex Mono', monospace;
+
+  font: 18px/145% var(--sans);
+  letter-spacing: 0.18px;
+  color-scheme: dark; /* Locked to dark mode */
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  @media (max-width: 1024px) {
+    font-size: 16px;
+  }
+}
+
+/* Stripped the prefers-color-scheme media query to enforce terminal aesthetics */
+
+#root {
+  width: 1126px;
+  max-width: 100%;
+  margin: 0 auto;
+  text-align: center;
+  border-inline: 1px solid var(--border); /* Thin 1px borders */
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background-color: var(--bg);
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+  font-weight: 500;
+  color: var(--text-h);
+  text-transform: uppercase; /* Fits the terminal vibe */
+}
+
+h1 {
+  font-size: 56px;
+  letter-spacing: -1.68px;
+  margin: 32px 0;
+  @media (max-width: 1024px) {
+    font-size: 36px;
+    margin: 20px 0;
+  }
+}
+
+h2 {
+  font-size: 24px;
+  line-height: 118%;
+  letter-spacing: -0.24px;
+  margin: 0 0 8px;
+  @media (max-width: 1024px) {
+    font-size: 20px;
+  }
+}
+
+p {
+  margin: 0;
+}
+
+/* Big numeric readouts & terminal code */
+code,
+.counter,
+.numeric-readout {
+  font-family: var(--mono);
+  display: inline-flex;
+  color: var(--text-h);
+  border: 1px solid var(--border); /* Thin 1px borders */
+  border-radius: 0; /* Stripped rounded corners */
+}
+
+code {
+  font-size: 15px;
+  line-height: 135%;
+  padding: 4px 8px;
+  background: var(--code-bg);
+}
+
+/* Custom classes for the Dashboard */
+.redline-hero {
+  width: 100%;
+  height: 2px;
+  background-color: var(--signal-red);
+  margin: 2rem 0;
+}
+
+.regime-calm {
+  color: var(--bg);
+  background-color: var(--calm-green);
+  padding: 0.5rem 1rem;
+  font-family: var(--mono);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.regime-redlined {
+  color: var(--bg);
+  background-color: var(--signal-red);
+  padding: 0.5rem 1rem;
+  font-family: var(--mono);
+  font-weight: 700;
+  text-transform: uppercase;
+}
