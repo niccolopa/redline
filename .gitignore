@@ -7,4 +7,4 @@ frontend/dist/
 out/
 cache/
 .DS_Store
-CLAUDE.md
+./CLAUDE.md
