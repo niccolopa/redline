@@ -39,3 +39,10 @@ ALL code, comments, UI copy, commit messages and README in English.
 
 ## Current deployed address
 (update after each deploy)
+
+## Brand kit
+Name: REDLINE. Terminal / trading-desk aesthetic.
+Colors: bg #0A0A0A, text #F5F5F0, signal red #FF2D2D, calm green #00C853.
+No gradients, no default purple. Type: IBM Plex Mono for numbers,
+Inter for labels. Hero element: the horizontal red threshold line.
+Big numeric readouts, thin 1px borders.
