@@ -206,7 +206,10 @@ def main():
     df = compute_scores(load_klines())
     threading.Thread(target=replay, args=(df,), daemon=True).start()
     print(f"serving state on http://127.0.0.1:{PORT}  (events -> {EVENTS_PATH})")
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    try:
+        ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
 
 
 if __name__ == "__main__":

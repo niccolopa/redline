@@ -1,106 +1,141 @@
-import time
+"""REDLINE oracle — streams engine events and pushes the score on-chain.
+
+    python engine/oracle.py
+
+Needs PRIVATE_KEY and CONTRACT_ADDRESS, read from the environment or .env
+in the repo root.
+"""
+
 import json
 import os
+import time
+from pathlib import Path
+
 from web3 import Web3
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
+# --- CONFIG -----------------------------------------------------------------
 RPC_URL = "https://testnet-rpc.monad.xyz"
-CONTRACT_ADDRESS = "0xYOUR_DEPLOYED_CONTRACT_ADDRESS" # Replace this!
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "YOUR_PRIVATE_KEY_HERE") # Never commit this
-EVENTS_FILE = "../events.jsonl"
+CHAIN_ID = 10143
 THRESHOLD = 70.0
 
-# Minimal ABI for Oracle operations
+ROOT = Path(__file__).resolve().parent.parent
+EVENTS_PATH = ROOT / "events.jsonl"
+
+# Minimal ABI for oracle operations
 ABI = [
     {"inputs": [{"internalType": "int256", "name": "_score", "type": "int256"}], "name": "postScore", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
-    {"inputs": [], "name": "redline", "outputs": [], "stateMutability": "nonpayable", "type": "function"}
+    {"inputs": [], "name": "redline", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
 ]
 
-w3 = Web3(Web3.HTTPProvider(RPC_URL))
-account = w3.eth.account.from_key(PRIVATE_KEY)
-contract = w3.eth.contract(address=w3.to_checksum_address(CONTRACT_ADDRESS), abi=ABI)
 
-def send_monad_tx(build_tx_func, nonce, gas_buffer=1.075):
-    """Builds, signs, and sends tx using Monad's sync RPC, with standard fallback."""
-    base_tx = build_tx_func.build_transaction({
-        'chainId': 10143,
-        'gas': 0, # Will estimate below
-        'gasPrice': w3.eth.gas_price,
-        'nonce': nonce,
+def load_env():
+    """Read KEY=value lines from .env into os.environ without overriding it.
+
+    ponytail: 4 lines instead of python-dotenv. Swap it in if .env grows
+    quotes, exports or multiline values.
+    """
+    env_file = ROOT / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+def require(name, length=None):
+    """Fail with a readable message instead of a hex-decoding traceback."""
+    value = os.environ.get(name, "")
+    if not value.startswith("0x") or (length and len(value) != length):
+        raise SystemExit(
+            f"{name} is missing or not set to a real value (got {value!r}).\n"
+            f"Put it in {ROOT / '.env'} as {name}=0x..."
+        )
+    return value
+
+
+# --- CHAIN ------------------------------------------------------------------
+
+
+def send_monad_tx(w3, fn, account, nonce, gas_buffer=1.075):
+    """Build, sign and send via Monad's sync RPC, falling back to standard send."""
+    tx = fn.build_transaction({
+        "chainId": CHAIN_ID,
+        "from": account.address,
+        "nonce": nonce,
     })
-    
-    # Monad requires explicitly buffered gas limits
-    est_gas = w3.eth.estimate_gas(base_tx)
-    base_tx['gas'] = int(est_gas * gas_buffer)
-    
-    signed_tx = w3.eth.account.sign_transaction(base_tx, private_key=PRIVATE_KEY)
-    
-    start_time = time.time()
+    tx["gas"] = int(tx["gas"] * gas_buffer)  # Monad wants headroom on the limit
+
+    signed = account.sign_transaction(tx)
+    raw = signed.raw_transaction
+
+    start = time.time()
     try:
-        # 1. Attempt Monad synchronous transaction
-        response = w3.provider.make_request("eth_sendRawTransactionSync", [signed_tx.rawTransaction.hex()])
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        
-        if 'error' in response:
-            raise Exception(response['error'])
-            
-        return elapsed_ms, "SYNC"
-    except Exception as e:
-        # 2. Fallback to standard EVM send + poll
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        response = w3.provider.make_request("eth_sendRawTransactionSync", [w3.to_hex(raw)])
+        if "error" in response:
+            raise RuntimeError(response["error"])
+        return int((time.time() - start) * 1000), "SYNC"
+    except Exception:
+        tx_hash = w3.eth.send_raw_transaction(raw)
         w3.eth.wait_for_transaction_receipt(tx_hash)
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        return elapsed_ms, "ASYNC"
+        return int((time.time() - start) * 1000), "ASYNC"
+
 
 def run_oracle():
+    load_env()
+    private_key = require("PRIVATE_KEY", length=66)
+    contract_address = require("CONTRACT_ADDRESS", length=42)
+
+    w3 = Web3(Web3.HTTPProvider(RPC_URL))
+    account = w3.eth.account.from_key(private_key)
+    contract = w3.eth.contract(address=w3.to_checksum_address(contract_address), abi=ABI)
+
     print(f">>> CONNECTED TO MONAD TESTNET: {w3.is_connected()}")
     print(f">>> ORACLE ADDRESS: {account.address}")
-    
+
     nonce = w3.eth.get_transaction_count(account.address)
     redline_triggered = False
-    last_score = -1
+    last_score = -100
 
-    # Keep file pointer at the end to stream new lines
-    if not os.path.exists(EVENTS_FILE):
-        open(EVENTS_FILE, 'w').close()
-        
-    f = open(EVENTS_FILE, 'r')
-    f.seek(0, os.SEEK_END)
-    
+    EVENTS_PATH.touch(exist_ok=True)
+    events = EVENTS_PATH.open("r", encoding="utf-8")
+    events.seek(0, os.SEEK_END)  # only stream lines written from now on
+
     print(">>> LISTENING TO ENGINE FEED...")
-    
+
     while True:
-        line = f.readline()
-        if not line:
+        line = events.readline()
+        if not line.strip():
             time.sleep(0.5)
             continue
-            
-        event = json.loads(line.strip())
-        current_score = int(event['score'])
-        
-        # Optimization: Only post if score changed significantly to save MON
-        if abs(current_score - last_score) >= 2 or current_score >= THRESHOLD:
-            print(f"\n[TICK {event['tick']}] Score: {current_score} | Pushing on-chain...")
-            
-            try:
-                # 1. Post Score
-                ms, method = send_monad_tx(contract.functions.postScore(current_score), nonce)
-                print(f"✅ postScore() landed in {ms}ms ({method})")
+
+        event = json.loads(line)
+        score = int(event["score"])
+
+        # Only post on a real move, to save MON
+        if abs(score - last_score) < 2 and score < THRESHOLD:
+            continue
+
+        print(f"\n[{event['close_time']}] Score: {score} | Pushing on-chain...")
+        try:
+            ms, method = send_monad_tx(w3, contract.functions.postScore(score), account, nonce)
+            print(f"OK postScore() landed in {ms}ms ({method})")
+            nonce += 1
+            last_score = score
+
+            if score >= THRESHOLD and not redline_triggered:
+                print("THRESHOLD BREACHED. TRIGGERING REDLINE()...")
+                ms, method = send_monad_tx(w3, contract.functions.redline(), account, nonce)
+                print(f"VAULT REDLINED IN {ms}ms ({method})")
+                redline_triggered = True
                 nonce += 1
-                last_score = current_score
-                
-                # 2. Evaluate Redline
-                if current_score >= THRESHOLD and not redline_triggered:
-                    print("🚨 THRESHOLD BREACHED. TRIGGERING REDLINE()...")
-                    ms_redline, method_redline = send_monad_tx(contract.functions.redline(), nonce)
-                    print(f"🛑 VAULT REDLINED IN {ms_redline}ms ({method_redline})")
-                    redline_triggered = True
-                    nonce += 1
-                    
-            except Exception as e:
-                print(f"❌ TX FAILED: {str(e)[:100]}")
+        except Exception as e:
+            print(f"TX FAILED: {str(e)[:200]}")
+            nonce = w3.eth.get_transaction_count(account.address)  # resync after a drop
+
 
 if __name__ == "__main__":
-    run_oracle()
+    try:
+        run_oracle()
+    except KeyboardInterrupt:
+        print("\nstopped")
