@@ -58,6 +58,9 @@ type Feed = Partial<Tick> & {
   };
   oracle?: { post_ms: number; method: string; post_tx: string; score: number;
     regime_prob?: number; redline_ms?: number; redline_tx?: string; redline_method?: string } | null;
+  // Price of the minute currently forming — moves between bars, so the page
+  // has a visible pulse even though the score only recomputes once a minute.
+  now?: { price: number; bar_closes_at: number; polled_at: number; stale?: boolean };
   history?: Tick[];
 };
 
@@ -182,6 +185,15 @@ export default function App() {
   const b = band(liveScore ?? 0, TH);
   const myMon = myBal !== undefined ? Number(formatEther(myBal)) : 0;
 
+  // Liveness. A 1-minute bar means the score is SUPPOSED to hold still between
+  // bars; these two make the difference between "working" and "frozen" visible.
+  const nextBarIn = feed?.now?.bar_closes_at
+    ? Math.max(0, Math.ceil((feed.now.bar_closes_at - now) / 1000)) : null;
+  const feedAge = feed?.now?.polled_at ? Math.round((now - feed.now.polled_at) / 1000) : null;
+  const feedOk = engineUp && feedAge !== null && feedAge < 20;
+  const livePrice = feed?.now?.price;
+  const drift = livePrice !== undefined && t?.close !== undefined ? livePrice - t.close : undefined;
+
   const err = txError ?? connectError ?? readError;
   const status =
     CONTRACT_ADDRESS === '0x' ? 'No VITE_CONTRACT_ADDRESS in .env — restart the dev server after setting it.'
@@ -236,12 +248,32 @@ export default function App() {
         <span style={{ fontFamily: C.mono, fontWeight: 700, color: m?.live ? C.green : C.amber }}>
           {!engineUp ? '● ENGINE OFFLINE' : m?.live ? '● LIVE MARKET DATA' : '● HISTORICAL REPLAY'}
         </span>
-        <span style={{ ...plain, flex: 1, minWidth: '300px' }}>
-          {!engineUp ? 'The risk engine is not running. Start the dev server with npm run dev.'
-            : m?.live ? <>Real {m.symbol} prices, streaming from the public Binance API right now — one new bar every minute. Nobody chose this data.</>
+        <span style={{ ...plain, flex: 1, minWidth: '280px' }}>
+          {!engineUp ? 'The risk engine is not running. Start it with npm run dev.'
+            : m?.live ? <>Real {m.symbol} prices from the public Binance API. <strong>The risk score is
+              recalculated once a minute</strong>, when each 1-minute bar closes — so it is meant to hold
+              steady in between. The price below updates every few seconds.</>
             : <>Recorded {m?.symbol} prices from {m?.window_from?.slice(0, 10)}, played back at {m?.replay_speed}× speed. Real market history, not a simulation.</>}
         </span>
-        {t && <span style={{ fontFamily: C.mono, fontSize: '1.1rem' }}>{usd(t.close)}</span>}
+        {m?.live && (
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontFamily: C.mono, fontSize: '1.35rem', lineHeight: 1.1 }}>
+              {livePrice !== undefined ? usd(livePrice) : '—'}
+              {drift !== undefined && Math.abs(drift) > 0.004 && (
+                <span style={{ fontSize: '0.8rem', color: drift < 0 ? C.red : C.green, marginLeft: '0.4rem' }}>
+                  {drift > 0 ? '▲' : '▼'}{num(Math.abs(drift), 2)}
+                </span>
+              )}
+            </div>
+            <div style={{ ...label, fontSize: '0.62rem' }}>
+              price now · next bar in {nextBarIn === null ? '—' : `${nextBarIn}s`}
+            </div>
+          </div>
+        )}
+        <div title={feedOk ? 'Engine responded within the last few seconds' : 'No fresh data from the engine'}
+          style={{ ...label, fontSize: '0.62rem', color: feedOk ? C.green : C.red, whiteSpace: 'nowrap' }}>
+          {feedOk ? '◉' : '○'} feed {feedAge === null ? 'offline' : `${feedAge}s ago`}
+        </div>
       </div>
 
       {/* ---------------- THE ANSWER ---------------- */}
@@ -272,6 +304,11 @@ export default function App() {
             <div style={{ position: 'absolute', left: `${TH}%`, top: -4, bottom: -4, width: 2, background: C.red }} />
           </div>
           <div style={plain}>{b.says} The alarm line is {TH}: below it nothing happens, at or above it the vault can act.</div>
+          <div style={{ ...label, fontSize: '0.62rem', marginTop: '0.4rem' }}>
+            {m?.live
+              ? `Last recalculated ${t?.time ?? '—'} · next in ${nextBarIn === null ? '—' : `${nextBarIn}s`}`
+              : `Bar ${t?.time ?? '—'} · replaying at ${m?.replay_speed ?? '—'}× speed`}
+          </div>
         </div>
       </div>
 

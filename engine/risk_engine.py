@@ -84,18 +84,27 @@ def load_klines(path=CSV_PATH):
 
 
 def fetch_live_klines():
-    """Last LIVE_LIMIT closed 1-minute bars of ETH/USDT from Binance.
+    """Closed 1-minute bars, plus the bar still forming right now.
 
-    The final kline Binance returns is the bar still forming right now, so it is
-    dropped — scoring a partial bar would report a volume shock that is only an
-    artefact of the minute not being over yet.
+    The final kline Binance returns is the current, incomplete minute. It is
+    excluded from the maths — scoring a partial bar would report a volume shock
+    that is only an artefact of the minute not being over yet — but its price is
+    returned separately, because that is the number that actually moves
+    second by second and proves the feed is alive.
     """
     url = f"{LIVE_URL}?symbol={LIVE_SYMBOL}&interval={LIVE_INTERVAL}&limit={LIVE_LIMIT}"
     request = urllib.request.Request(url, headers={"User-Agent": "redline/1.0"})
     with urllib.request.urlopen(request, timeout=15) as response:
         rows = json.load(response)
     df = pd.DataFrame(rows, columns=COLUMNS)
-    return df[["close_time", "close", "volume"]].astype(float).iloc[:-1].reset_index(drop=True)
+    df = df[["close_time", "close", "volume"]].astype(float)
+    forming = df.iloc[-1]
+    closed = df.iloc[:-1].reset_index(drop=True)
+    return closed, {
+        "price": round(float(forming.close), 2),
+        "bar_closes_at": int(forming.close_time),
+        "polled_at": int(time.time() * 1000),
+    }
 
 
 def zscore(series):
@@ -160,6 +169,10 @@ def pick_start(df):
 CURRENT = {"status": "warming up"}
 HISTORY = deque(maxlen=HISTORY_LEN)
 META = {}
+# The price of the minute currently forming, refreshed every poll. A 1-minute
+# bar means the SCORE only moves once a minute; without this the UI looks frozen
+# even when everything is working.
+LIVE_NOW = {}
 
 
 def utc(ms):
@@ -264,9 +277,10 @@ def live_stream():
     Unlike the replay this never ends and nobody chose the window. If the score
     stays near zero all afternoon, that is the correct answer: the market is calm.
     """
-    global CURRENT, META
+    global CURRENT, META, LIVE_NOW
 
-    df = compute_scores(fetch_live_klines())
+    closed, LIVE_NOW = fetch_live_klines()
+    df = compute_scores(closed)
     warm = df.dropna(subset=["score"])
     META = describe(df, warm, live=True)
     open_price = warm["close"].iloc[0]
@@ -286,9 +300,11 @@ def live_stream():
     with EVENTS_PATH.open("w", encoding="utf-8") as events:
         while True:
             try:
-                df = compute_scores(fetch_live_klines())
+                closed, LIVE_NOW = fetch_live_klines()
+                df = compute_scores(closed)
             except Exception as e:                      # network blip, not fatal
                 print(f"  live fetch failed, retrying: {str(e)[:90]}")
+                LIVE_NOW = {**LIVE_NOW, "stale": True}
                 time.sleep(LIVE_POLL_SECONDS)
                 continue
 
@@ -326,6 +342,7 @@ class Handler(BaseHTTPRequestHandler):
             **CURRENT,
             "threshold": REDLINE_THRESHOLD,
             "meta": META,
+            "now": LIVE_NOW,
             "oracle": read_oracle_status(),
             "history": list(HISTORY),
         }).encode()

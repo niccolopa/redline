@@ -21,15 +21,30 @@ const monadTestnet = defineChain({
 })
 
 // 2. Configure Wagmi
+// The public RPC rate-limits hard. Batching collapses the page's ~9 contract
+// reads into a single HTTP request, and a slower poll keeps eth_getLogs from
+// hammering it. Without both, reads start failing with 429 within a minute.
 const config = createConfig({
   chains: [monadTestnet],
   transports: {
-    [monadTestnet.id]: http(),
+    [monadTestnet.id]: http(undefined, {
+      batch: { wait: 40 },
+      retryCount: 3,
+      retryDelay: 800,
+    }),
   },
+  pollingInterval: 8_000,
 })
 
 // 3. Setup React Query Client
-const queryClient = new QueryClient()
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      refetchOnWindowFocus: false, // every focus change was another burst of reads
+      retry: 2,
+    },
+  },
+})
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
