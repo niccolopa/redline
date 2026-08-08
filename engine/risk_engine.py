@@ -1,16 +1,22 @@
-"""REDLINE risk engine — replays a Binance 1m crash at 60x and scores the regime.
+"""REDLINE risk engine — scores the market regime from live or historical bars.
 
 Deterministic math only. Every formula below is one readable line so it can be
-verified by hand against the CSV.
+verified by hand.
 
-    python engine/risk_engine.py            replay + serve state on PORT
+    python engine/risk_engine.py            LIVE ETH/USD from Binance (default)
+    python engine/risk_engine.py --replay   historical crash from data/crash.csv
     python engine/risk_engine.py --selftest assert the math, exit
+
+Live is the default because a demo should run on the real market. The replay
+exists because a live market is usually calm: it is the only honest way to show
+the circuit breaker actually firing. The UI always states which one is running.
 """
 
 import json
 import sys
 import threading
 import time
+import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -36,10 +42,20 @@ REDLINE_THRESHOLD = 70     # must match RedlineVault's constructor argument
 MINUTES_PER_YEAR = 525_600
 ANNUALIZE = MINUTES_PER_YEAR ** 0.5   # ~725x, scales per-bar sigma to annual
 
-# What the dataset actually is. Shown verbatim in the UI — no vague "market data".
+# What the data actually is. Shown verbatim in the UI — no vague "market data".
 SYMBOL = "ETH/USDT"
-SOURCE = "Binance spot, 1-minute klines"
 QUOTE = "USDT (1 USDT ~ 1 USD)"
+
+# LIVE SOURCE: Binance public spot REST API, no key, no account.
+# Same 12-column kline schema as data/crash.csv, so both paths share the math.
+LIVE_URL = "https://api.binance.com/api/v3/klines"
+LIVE_SYMBOL = "ETHUSDT"
+LIVE_INTERVAL = "1m"
+LIVE_LIMIT = 1000          # ~16.7 h of history; the z-window needs 240 bars
+LIVE_POLL_SECONDS = 5      # how often we ask whether a new 1m bar has closed
+
+SOURCE_LIVE = f"Binance spot REST {LIVE_URL} ({LIVE_SYMBOL}, {LIVE_INTERVAL})"
+SOURCE_REPLAY = "Binance spot, 1-minute klines (historical file)"
 
 REPLAY_SPEED = 60          # minutes of market time per second of wall clock
 PRE_ROLL_BARS = 90         # calm bars replayed before the worst bar in the file
@@ -65,6 +81,21 @@ COLUMNS = [
 def load_klines(path=CSV_PATH):
     df = pd.read_csv(path, header=None, names=COLUMNS)
     return df[["close_time", "close", "volume"]].astype(float)
+
+
+def fetch_live_klines():
+    """Last LIVE_LIMIT closed 1-minute bars of ETH/USDT from Binance.
+
+    The final kline Binance returns is the bar still forming right now, so it is
+    dropped — scoring a partial bar would report a volume shock that is only an
+    artefact of the minute not being over yet.
+    """
+    url = f"{LIVE_URL}?symbol={LIVE_SYMBOL}&interval={LIVE_INTERVAL}&limit={LIVE_LIMIT}"
+    request = urllib.request.Request(url, headers={"User-Agent": "redline/1.0"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        rows = json.load(response)
+    df = pd.DataFrame(rows, columns=COLUMNS)
+    return df[["close_time", "close", "volume"]].astype(float).iloc[:-1].reset_index(drop=True)
 
 
 def zscore(series):
@@ -135,11 +166,12 @@ def utc(ms):
     return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ms / 1000))
 
 
-def describe(df, window):
+def describe(df, window, live=False):
     """Everything the UI needs to state its own provenance, no hardcoded strings."""
     return {
+        "live": live,
         "symbol": SYMBOL,
-        "source": SOURCE,
+        "source": SOURCE_LIVE if live else SOURCE_REPLAY,
         "quote": QUOTE,
         "interval": "1m",
         "file": str(CSV_PATH.relative_to(ROOT)),
@@ -183,6 +215,7 @@ def build_tick(bar, open_price):
         "change_pct": round((bar.close / open_price - 1) * 100, 2),
         "volume": round(bar.volume, 2),
         "score": round(bar.score, 2),
+        "log_return": float(bar.log_return),   # full precision: fed to the on-chain HMM
         "mode": "REDLINED" if bar.score >= REDLINE_THRESHOLD else "CALM",
         "components": norm,
         "raw": {
@@ -207,10 +240,12 @@ def replay(df):
     print(f"replaying bars {start}..{start + len(window)} at {REPLAY_SPEED}x")
 
     global CURRENT, META
-    META = describe(df, window)
+    META = describe(df, window, live=False)
     open_price = window.close.iloc[0]
 
-    with EVENTS_PATH.open("a", encoding="utf-8") as events:
+    # Truncate per run: the oracle replays this file from bar 0 into an on-chain
+    # recursion, so it must contain exactly one run's observations and no more.
+    with EVENTS_PATH.open("w", encoding="utf-8") as events:
         for bar in window.itertuples():
             tick = build_tick(bar, open_price)
             CURRENT = tick
@@ -221,6 +256,53 @@ def replay(df):
             time.sleep(60 / REPLAY_SPEED)
 
     print("replay finished, holding last tick")
+
+
+def live_stream():
+    """Score the real ETH/USD market, one bar per minute, as bars close.
+
+    Unlike the replay this never ends and nobody chose the window. If the score
+    stays near zero all afternoon, that is the correct answer: the market is calm.
+    """
+    global CURRENT, META
+
+    df = compute_scores(fetch_live_klines())
+    warm = df.dropna(subset=["score"])
+    META = describe(df, warm, live=True)
+    open_price = warm["close"].iloc[0]
+    last_seen = None
+
+    print(f"LIVE {SYMBOL} from Binance — {len(df)} bars warmed up, "
+          f"latest ${df.close.iloc[-1]:,.2f} at {utc(df.close_time.iloc[-1])}")
+    print(f"polling every {LIVE_POLL_SECONDS}s for the next closed 1m bar")
+
+    # Seed the chart with recent history so the UI is not blank for a minute.
+    for bar in warm.tail(HISTORY_LEN).itertuples():
+        HISTORY.append(build_tick(bar, open_price))
+    if HISTORY:
+        CURRENT = HISTORY[-1]
+        last_seen = CURRENT["close_time"]
+
+    with EVENTS_PATH.open("w", encoding="utf-8") as events:
+        while True:
+            try:
+                df = compute_scores(fetch_live_klines())
+            except Exception as e:                      # network blip, not fatal
+                print(f"  live fetch failed, retrying: {str(e)[:90]}")
+                time.sleep(LIVE_POLL_SECONDS)
+                continue
+
+            bar = df.iloc[-1]
+            if int(bar.close_time) != last_seen and not pd.isna(bar.score):
+                last_seen = int(bar.close_time)
+                tick = build_tick(bar, open_price)
+                CURRENT = tick
+                HISTORY.append(tick)
+                events.write(json.dumps(tick) + "\n")
+                events.flush()
+                print(f"{tick['score']:6.2f}  {tick['mode']:8}  "
+                      f"${tick['close']:,.2f}  {tick['time']}")
+            time.sleep(LIVE_POLL_SECONDS)
 
 
 # --- HTTP -------------------------------------------------------------------
@@ -288,8 +370,13 @@ def main():
     if "--selftest" in sys.argv:
         return selftest()
 
-    df = compute_scores(load_klines())
-    threading.Thread(target=replay, args=(df,), daemon=True).start()
+    if "--replay" in sys.argv:
+        df = compute_scores(load_klines())
+        worker = threading.Thread(target=replay, args=(df,), daemon=True)
+    else:
+        worker = threading.Thread(target=live_stream, daemon=True)
+    worker.start()
+
     print(f"serving state on http://127.0.0.1:{PORT}  (events -> {EVENTS_PATH})")
     try:
         ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

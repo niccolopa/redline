@@ -1,14 +1,16 @@
+# Secrets — never commit
+.env
+
 # Python / Environment
 .venv/
 __pycache__/
 *.pyc
-.env
 
 # Node / Frontend
 node_modules/
 frontend/dist/
 
-# Solidity / Foundry Build
+# Solidity build output (Foundry, if we ever add it)
 out/
 cache/
 broadcast/
@@ -16,9 +18,16 @@ broadcast/
 # OS
 .DS_Store
 
-# Hackathon Workflow & Claude Files
-CLAUDE.md
-HANDOFF.md
-
-# Generated Data / Logs
+# Runtime artefacts, regenerated on every run.
+# NOTE: gitignore has no trailing comments — a pattern is the whole line.
+# engine -> oracle feed, truncated per run
 events.jsonl
+# last measured tx latency, rewritten every bar
+oracle_status.json
+
+# Deliberately COMMITTED, do not add here:
+#   abi.json         written by deploy.py; frontend and oracle both read it
+#   hmm_params.json  the fitted model behind the on-chain immutables — provenance
+#   data/crash.csv   historical dataset used by --replay
+#   CLAUDE.md        project brief; the repo is public by hackathon rules
+#   HANDOFF.md       running log of decisions

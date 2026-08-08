@@ -1,12 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
-  useAccount,
-  useConnect,
-  useDisconnect,
-  useReadContract,
-  useSwitchChain,
-  useWatchContractEvent,
-  useWriteContract,
+  useAccount, useConnect, useDisconnect, useReadContract,
+  useSwitchChain, useWatchContractEvent, useWriteContract,
 } from 'wagmi';
 import { injected } from 'wagmi/connectors';
 import { formatEther, parseEther } from 'viem';
@@ -16,9 +11,7 @@ import { formatEther, parseEther } from 'viem';
 // ==========================================
 const MONAD_TESTNET = 10143;
 const EXPLORER = 'https://testnet.monadscan.com';
-const ENGINE_URL = 'http://127.0.0.1:8000'; // risk_engine.py, polled once per second
-// From VITE_CONTRACT_ADDRESS in the repo-root .env (vite.config envDir: '..').
-// '0x' when unset, so reads fail loudly into the STATUS bar instead of silently.
+const ENGINE_URL = 'http://127.0.0.1:8000';
 const CONTRACT_ADDRESS = (import.meta.env.VITE_CONTRACT_ADDRESS ?? '0x') as `0x${string}`;
 
 const VaultABI = [
@@ -32,15 +25,15 @@ const VaultABI = [
   { inputs: [], name: 'latestScore', outputs: [{ name: '', type: 'int256' }], stateMutability: 'view', type: 'function' },
   { inputs: [], name: 'lastUpdateTimestamp', outputs: [{ name: '', type: 'uint256' }], stateMutability: 'view', type: 'function' },
   { inputs: [], name: 'redlineThreshold', outputs: [{ name: '', type: 'int256' }], stateMutability: 'view', type: 'function' },
+  { inputs: [], name: 'regimeProb', outputs: [{ name: '', type: 'int256' }], stateMutability: 'view', type: 'function' },
+  { inputs: [], name: 'regimeThreshold', outputs: [{ name: '', type: 'int256' }], stateMutability: 'view', type: 'function' },
+  { inputs: [], name: 'barsProcessed', outputs: [{ name: '', type: 'uint256' }], stateMutability: 'view', type: 'function' },
   { inputs: [], name: 'oracle', outputs: [{ name: '', type: 'address' }], stateMutability: 'view', type: 'function' },
   { inputs: [{ name: '', type: 'address' }], name: 'userBalances', outputs: [{ name: '', type: 'uint256' }], stateMutability: 'view', type: 'function' },
-  { anonymous: false, inputs: [{ indexed: false, name: 'score', type: 'int256' }, { indexed: false, name: 'timestamp', type: 'uint256' }], name: 'ScoreUpdated', type: 'event' },
+  { anonymous: false, inputs: [{ indexed: false, name: 'logReturn', type: 'int256' }, { indexed: false, name: 'regimeProb', type: 'int256' }, { indexed: false, name: 'timestamp', type: 'uint256' }], name: 'RegimeUpdated', type: 'event' },
   { anonymous: false, inputs: [{ indexed: false, name: 'timestamp', type: 'uint256' }, { indexed: false, name: 'amountSheltered', type: 'uint256' }, { indexed: true, name: 'triggeredBy', type: 'address' }], name: 'Redlined', type: 'event' },
 ] as const;
 
-// ==========================================
-// ENGINE PAYLOAD (see risk_engine.build_tick)
-// ==========================================
 type Tick = {
   close_time: number; time: string; close: number; change_pct: number;
   volume: number; score: number; mode: 'CALM' | 'REDLINED';
@@ -55,88 +48,73 @@ type Tick = {
 type Feed = Partial<Tick> & {
   threshold?: number;
   meta?: {
-    symbol: string; source: string; quote: string; interval: string; file: string;
-    file_bars: number; file_from: string; file_to: string;
+    live: boolean; symbol: string; source: string; quote: string; interval: string;
+    file: string; file_bars: number; file_from: string; file_to: string;
     window_bars: number; window_from: string; window_to: string;
     open_price: number; replay_speed: number; threshold: number;
     weights: { volatility: number; neg_return: number; volume_shock: number };
     windows: { vol: number; z: number; volume: number };
     z_span: number; shock_span: number;
   };
-  oracle?: {
-    post_ms: number; method: string; post_tx: string; score: number;
-    redline_ms?: number; redline_tx?: string; redline_method?: string;
-  } | null;
+  oracle?: { post_ms: number; method: string; post_tx: string; score: number;
+    regime_prob?: number; redline_ms?: number; redline_tx?: string; redline_method?: string } | null;
   history?: Tick[];
 };
 
 // ==========================================
-// FORMATTING — every number on screen carries its unit
+// FORMATTING — every number keeps its unit
 // ==========================================
 const usd = (n: number) => '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const num = (n: number, d = 2) => n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
 const pct = (n: number, d = 2) => (n > 0 ? '+' : '') + num(n, d) + ' %';
-const sigma = (n: number) => (n > 0 ? '+' : '') + num(n, 2) + ' σ';
+const sig = (n: number) => (n > 0 ? '+' : '') + num(n, 2) + 'σ';
 
 const C = {
-  bg: 'var(--bg)', text: 'var(--text)', red: 'var(--signal-red)',
-  green: 'var(--calm-green)', border: 'var(--border)', panel: 'var(--code-bg)',
-  mono: 'var(--mono)', sans: 'var(--sans)', dim: '#8A8A85',
+  bg: 'var(--bg)', text: 'var(--text)', red: 'var(--signal-red)', green: 'var(--calm-green)',
+  border: 'var(--border)', panel: 'var(--code-bg)', mono: 'var(--mono)', sans: 'var(--sans)',
+  dim: '#8A8A85', hair: '#2A2A28', amber: '#FFB300',
 };
 
-const panel: React.CSSProperties = {
-  border: `1px solid ${C.border}`, background: C.bg, padding: '1.25rem',
-  textAlign: 'left', minWidth: 0,
-};
-const label: React.CSSProperties = {
-  fontFamily: C.sans, fontSize: '0.7rem', letterSpacing: '0.12em',
-  textTransform: 'uppercase', color: C.dim,
-};
-const cell: React.CSSProperties = {
-  fontFamily: C.mono, fontSize: '0.8rem', padding: '0.45rem 0.5rem',
-  borderBottom: `1px solid #2A2A28`, whiteSpace: 'nowrap',
-};
+const panel: React.CSSProperties = { border: `1px solid ${C.hair}`, background: C.bg, padding: '1.25rem', textAlign: 'left', minWidth: 0 };
+const label: React.CSSProperties = { fontFamily: C.sans, fontSize: '0.7rem', letterSpacing: '0.12em', textTransform: 'uppercase', color: C.dim };
+const plain: React.CSSProperties = { fontFamily: C.sans, fontSize: '0.85rem', lineHeight: 1.65, color: '#C8C8C2' };
+const cell: React.CSSProperties = { fontFamily: C.mono, fontSize: '0.78rem', padding: '0.45rem 0.5rem', borderBottom: `1px solid ${C.hair}` };
+const summary: React.CSSProperties = { ...label, cursor: 'pointer', padding: '0.6rem 0', color: C.text, listStyle: 'revert' };
+
+/** Plain-English band for a 0-100 risk score. */
+function band(score: number, threshold: number) {
+  if (score >= threshold) return { word: 'DANGER', color: C.red, says: 'Conditions match a crash.' };
+  if (score >= threshold * 0.55) return { word: 'ELEVATED', color: C.amber, says: 'Choppier than usual, below the alarm line.' };
+  return { word: 'NORMAL', color: C.green, says: 'Nothing unusual in the market.' };
+}
 
 // ==========================================
-// CHART — price and score share an x-axis. No chart library: one <svg>.
+// CHART
 // ==========================================
 function Chart({ history, threshold }: { history: Tick[]; threshold: number }) {
   if (history.length < 2) {
-    return <div style={{ ...label, padding: '3rem 0', textAlign: 'center' }}>WAITING FOR ENGINE FEED…</div>;
+    return <div style={{ ...label, padding: '3rem 0', textAlign: 'center' }}>WAITING FOR THE ENGINE…</div>;
   }
-  const W = 1000, H1 = 130, H2 = 110, GAP = 26;
+  const W = 1000, H1 = 120, GAP = 24, H2 = 100;
   const prices = history.map((t) => t.close);
   const lo = Math.min(...prices), hi = Math.max(...prices);
   const x = (i: number) => (i / (history.length - 1)) * W;
-  const yPrice = (p: number) => H1 - ((p - lo) / (hi - lo || 1)) * (H1 - 8) - 4;
-  const yScore = (s: number) => H1 + GAP + (H2 - (s / 100) * H2);
-  const line = (pts: string[]) => pts.join(' ');
+  const yP = (p: number) => H1 - ((p - lo) / (hi - lo || 1)) * (H1 - 10) - 5;
+  const yS = (s: number) => H1 + GAP + (H2 - (s / 100) * H2);
   const breach = history.findIndex((t) => t.score >= threshold);
 
   return (
     <svg viewBox={`0 0 ${W} ${H1 + GAP + H2}`} style={{ width: '100%', height: 'auto', display: 'block' }}>
-      {/* price */}
-      <polyline fill="none" stroke={C.text} strokeWidth="1.5"
-        points={line(history.map((t, i) => `${x(i)},${yPrice(t.close)}`))} />
+      <polyline fill="none" stroke={C.text} strokeWidth="1.5" points={history.map((t, i) => `${x(i)},${yP(t.close)}`).join(' ')} />
       <text x="4" y="12" fill={C.dim} fontSize="11" fontFamily="IBM Plex Mono">{usd(hi)}</text>
       <text x="4" y={H1 - 2} fill={C.dim} fontSize="11" fontFamily="IBM Plex Mono">{usd(lo)}</text>
 
-      {/* score, filled under the curve */}
-      <polygon fill="#FF2D2D18" points={line([`0,${H1 + GAP + H2}`, ...history.map((t, i) => `${x(i)},${yScore(t.score)}`), `${W},${H1 + GAP + H2}`])} />
-      <polyline fill="none" stroke={C.red} strokeWidth="1.5"
-        points={line(history.map((t, i) => `${x(i)},${yScore(t.score)}`))} />
-
-      {/* THE RED LINE — the hero element */}
-      <line x1="0" y1={yScore(threshold)} x2={W} y2={yScore(threshold)} stroke={C.red} strokeWidth="2" />
-      <text x="4" y={yScore(threshold) - 5} fill={C.red} fontSize="11" fontFamily="IBM Plex Mono">
-        THRESHOLD {threshold}
-      </text>
-      <text x="4" y={H1 + GAP + H2 - 3} fill={C.dim} fontSize="11" fontFamily="IBM Plex Mono">0</text>
-
-      {/* where the score first crossed */}
-      {breach >= 0 && (
-        <line x1={x(breach)} y1="0" x2={x(breach)} y2={H1 + GAP + H2} stroke={C.red} strokeWidth="1" strokeDasharray="3 3" />
-      )}
+      <polygon fill="#FF2D2D18" points={[`0,${H1 + GAP + H2}`, ...history.map((t, i) => `${x(i)},${yS(t.score)}`), `${W},${H1 + GAP + H2}`].join(' ')} />
+      <polyline fill="none" stroke={C.red} strokeWidth="1.5" points={history.map((t, i) => `${x(i)},${yS(t.score)}`).join(' ')} />
+      <line x1="0" y1={yS(threshold)} x2={W} y2={yS(threshold)} stroke={C.red} strokeWidth="2" />
+      <text x="4" y={yS(threshold) - 5} fill={C.red} fontSize="11" fontFamily="IBM Plex Mono">ALARM LINE — {threshold}</text>
+      <text x="4" y={H1 + GAP + H2 - 3} fill={C.dim} fontSize="11" fontFamily="IBM Plex Mono">0 = calm</text>
+      {breach >= 0 && <line x1={x(breach)} y1="0" x2={x(breach)} y2={H1 + GAP + H2} stroke={C.red} strokeWidth="1" strokeDasharray="3 3" />}
     </svg>
   );
 }
@@ -153,18 +131,17 @@ export default function App() {
   const [engineUp, setEngineUp] = useState(false);
   const [amount, setAmount] = useState('');
   const [flash, setFlash] = useState(false);
+  const [now, setNow] = useState(Date.now());
 
-  // Engine feed: 1 Hz, independent of the chain. This is the DISPLAY path.
   useEffect(() => {
-    const poll = () =>
-      fetch(ENGINE_URL)
-        .then((r) => r.json())
-        .then((d) => { setFeed(d); setEngineUp(true); })
-        .catch(() => setEngineUp(false));
+    const poll = () => fetch(ENGINE_URL).then((r) => r.json())
+      .then((d) => { setFeed(d); setEngineUp(true); })
+      .catch(() => setEngineUp(false));
     poll();
     const id = setInterval(poll, 1000);
     return () => clearInterval(id);
   }, []);
+  useEffect(() => { const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, []);
 
   const read = { address: CONTRACT_ADDRESS, abi: VaultABI } as const;
   const { data: mode, refetch: refetchMode, error: readError } = useReadContract({ ...read, functionName: 'currentMode' });
@@ -173,334 +150,374 @@ export default function App() {
   const { data: onChainScore, refetch: refetchScore } = useReadContract({ ...read, functionName: 'latestScore' });
   const { data: lastUpdate, refetch: refetchStamp } = useReadContract({ ...read, functionName: 'lastUpdateTimestamp' });
   const { data: threshold } = useReadContract({ ...read, functionName: 'redlineThreshold' });
+  const { data: rProb, refetch: refetchRegime } = useReadContract({ ...read, functionName: 'regimeProb' });
+  const { data: rGate } = useReadContract({ ...read, functionName: 'regimeThreshold' });
+  const { data: bars, refetch: refetchBars } = useReadContract({ ...read, functionName: 'barsProcessed' });
   const { data: oracleAddr } = useReadContract({ ...read, functionName: 'oracle' });
   const { data: myBal, refetch: refetchMine } = useReadContract({
     ...read, functionName: 'userBalances', args: [address ?? '0x0000000000000000000000000000000000000000'],
   });
 
   const refetchAll = () => {
-    refetchMode(); refetchVault(); refetchBunker(); refetchScore(); refetchStamp(); refetchMine();
+    refetchMode(); refetchVault(); refetchBunker(); refetchScore();
+    refetchStamp(); refetchMine(); refetchRegime(); refetchBars();
   };
-
-  useWatchContractEvent({ ...read, eventName: 'ScoreUpdated', onLogs: () => { refetchScore(); refetchStamp(); } });
-  useWatchContractEvent({
-    ...read, eventName: 'Redlined',
-    onLogs: () => { setFlash(true); setTimeout(() => setFlash(false), 600); refetchAll(); },
-  });
-
-  const isRedlined = mode === 1;
-  const wrongChain = isConnected && chainId !== MONAD_TESTNET;
-  const THRESHOLD = Number(threshold ?? feed?.threshold ?? 70);
-  const isOracle = !!address && !!oracleAddr && address.toLowerCase() === oracleAddr.toLowerCase();
-
-  // Score age: how stale the on-chain number is. NOT transaction latency.
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => { const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, []);
-  const scoreAge = lastUpdate && Number(lastUpdate) > 0 ? Math.max(0, Math.round(now / 1000 - Number(lastUpdate))) : null;
-
-  // STATUS: a button that "does nothing" is a swallowed error. Full text, no truncation.
-  const err = txError ?? connectError ?? readError;
-  const status =
-    CONTRACT_ADDRESS === '0x' ? 'NO VITE_CONTRACT_ADDRESS IN .env — RESTART VITE AFTER SETTING IT'
-    : err ? err.message.replace(/\s+/g, ' ').slice(0, 240)
-    : isPending ? 'TRANSACTION PENDING — CONFIRM IN METAMASK'
-    : !isConnected ? 'WALLET DISCONNECTED — READ-ONLY. CONNECT TO DEPOSIT OR WITHDRAW.'
-    : wrongChain ? `WRONG NETWORK (chain ${chainId}) — CLICK HERE TO SWITCH TO MONAD TESTNET`
-    : `CONNECTED — VAULT ${CONTRACT_ADDRESS}`;
-  const isErr = !!err || wrongChain || CONTRACT_ADDRESS === '0x';
-
-  const send = (functionName: 'deposit' | 'withdraw' | 'redline' | 'setMode', extra = {}) => {
-    resetTx();
-    writeContract({ ...read, functionName, ...extra } as never, { onSuccess: () => setTimeout(refetchAll, 1200) });
-  };
+  useWatchContractEvent({ ...read, eventName: 'RegimeUpdated', onLogs: () => { refetchScore(); refetchStamp(); refetchRegime(); refetchBars(); } });
+  useWatchContractEvent({ ...read, eventName: 'Redlined', onLogs: () => { setFlash(true); setTimeout(() => setFlash(false), 600); refetchAll(); } });
 
   const t = feed as Tick | null;
   const m = feed?.meta;
   const o = feed?.oracle;
+  const isRedlined = mode === 1;
+  const wrongChain = isConnected && chainId !== MONAD_TESTNET;
+  const TH = Number(threshold ?? feed?.threshold ?? 70);
+  const P_TURB = rProb !== undefined ? Number(rProb) / 1e18 : undefined;
+  const P_GATE = rGate !== undefined ? Number(rGate) / 1e18 : 0.8;
+  const chainScore = onChainScore !== undefined ? Number(onChainScore) : undefined;
+  const liveScore = t?.score;
+  const key1 = (chainScore ?? 0) >= TH;
+  const key2 = (P_TURB ?? 0) >= P_GATE;
+  const isOracle = !!address && !!oracleAddr && address.toLowerCase() === oracleAddr.toLowerCase();
+  const lag = lastUpdate && Number(lastUpdate) > 0 ? Math.max(0, Math.round(now / 1000 - Number(lastUpdate))) : null;
+  const b = band(liveScore ?? 0, TH);
+  const myMon = myBal !== undefined ? Number(formatEther(myBal)) : 0;
+
+  const err = txError ?? connectError ?? readError;
+  const status =
+    CONTRACT_ADDRESS === '0x' ? 'No VITE_CONTRACT_ADDRESS in .env — restart the dev server after setting it.'
+    : err ? err.message.replace(/\s+/g, ' ').slice(0, 240)
+    : isPending ? 'Transaction pending — confirm it in MetaMask.'
+    : !isConnected ? 'Read-only. Connect a wallet to deposit or withdraw.'
+    : wrongChain ? `Wrong network (chain ${chainId}). Click here to switch to Monad Testnet.`
+    : `Connected to Monad Testnet. Vault ${CONTRACT_ADDRESS}`;
+  const isErr = !!err || wrongChain || CONTRACT_ADDRESS === '0x';
+
+  const send = (fn: 'deposit' | 'withdraw' | 'redline' | 'setMode', extra = {}) => {
+    resetTx();
+    writeContract({ ...read, functionName: fn, ...extra } as never, { onSuccess: () => setTimeout(refetchAll, 1500) });
+  };
+
   const rows = t && m ? [
-    {
-      k: 'VOLATILITY', raw: `${num(t.raw.sigma_pct_per_min, 3)} %/min · ${num(t.raw.sigma_pct_annual, 0)} % annualized`,
-      sub: `std dev of last ${m.windows.vol} log returns`, z: sigma(t.raw.z_volatility),
-      n: t.components.volatility, w: m.weights.volatility, p: t.points.volatility,
-    },
-    {
-      k: 'DOWNSIDE MOVE', raw: `${pct(t.raw.log_return_pct, 3)} this bar`,
-      sub: 'log return of the 1-minute bar', z: sigma(t.raw.z_neg_return),
-      n: t.components.neg_return, w: m.weights.neg_return, p: t.points.neg_return,
-    },
-    {
-      k: 'VOLUME SHOCK', raw: `${num(t.volume, 0)} ETH · ${num(t.raw.volume_ratio, 2)}× mean`,
-      sub: `vs mean of last ${m.windows.volume} bars`, z: '—',
-      n: t.components.volume_shock, w: m.weights.volume_shock, p: t.points.volume_shock,
-    },
+    { k: 'Price swinging', tech: 'Rolling volatility, 30-bar σ',
+      raw: `${num(t.raw.sigma_pct_per_min, 3)} %/min · ${num(t.raw.sigma_pct_annual, 0)} % annualized`,
+      z: sig(t.raw.z_volatility), n: t.components.volatility, w: m.weights.volatility, p: t.points.volatility },
+    { k: 'Falling this minute', tech: 'Negative log return of the bar',
+      raw: pct(t.raw.log_return_pct, 3), z: sig(t.raw.z_neg_return),
+      n: t.components.neg_return, w: m.weights.neg_return, p: t.points.neg_return },
+    { k: 'Unusual trading volume', tech: 'Volume vs 30-bar mean',
+      raw: `${num(t.volume, 0)} ETH · ${num(t.raw.volume_ratio, 2)}× normal`, z: '—',
+      n: t.components.volume_shock, w: m.weights.volume_shock, p: t.points.volume_shock },
   ] : [];
 
   return (
-    <div style={{
-      padding: '1.5rem', maxWidth: '1400px', margin: '0 auto', textAlign: 'left',
-      background: flash ? C.red : 'transparent', transition: 'background 0.15s',
-    }}>
-      {/* ---------- HEADER ---------- */}
+    <div style={{ padding: '1.5rem', maxWidth: '1400px', margin: '0 auto', textAlign: 'left', background: flash ? C.red : 'transparent', transition: 'background 0.15s' }}>
+
+      {/* ---------------- HEADER ---------------- */}
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: `1px solid ${C.border}`, paddingBottom: '0.9rem' }}>
         <div>
           <div style={{ fontFamily: C.mono, fontSize: '1.5rem', fontWeight: 700, letterSpacing: '0.04em' }}>REDLINE</div>
-          <div style={{ ...label, marginTop: 2 }}>ON-CHAIN RISK CIRCUIT BREAKER · MONAD TESTNET (CHAIN 10143)</div>
+          <div style={{ ...plain, fontSize: '0.8rem' }}>
+            A savings vault that watches the market and pulls its own money to safety when a crash starts.
+          </div>
         </div>
         <button onClick={() => (isConnected ? disconnect() : connect({ connector: injected() }))}
           style={{ fontFamily: C.mono, fontSize: '0.8rem', padding: '0.7rem 1.1rem', background: 'transparent', color: C.text, border: `1px solid ${C.border}`, cursor: 'pointer' }}>
-          {isConnected ? `${address?.slice(0, 6)}…${address?.slice(-4)}${isOracle ? ' · ORACLE' : ''}` : 'CONNECT WALLET'}
+          {isConnected ? `${address?.slice(0, 6)}…${address?.slice(-4)}${isOracle ? ' · operator' : ''}` : 'CONNECT WALLET'}
         </button>
       </header>
 
-      {/* ---------- STATUS ---------- */}
       <div onClick={() => wrongChain && switchChain({ chainId: MONAD_TESTNET })}
-        style={{
-          fontFamily: C.mono, fontSize: '0.72rem', padding: '0.6rem 0.8rem', margin: '0.9rem 0',
-          border: `1px solid ${isErr ? C.red : '#2A2A28'}`, color: isErr ? C.red : C.dim,
-          cursor: wrongChain ? 'pointer' : 'default', wordBreak: 'break-word',
-        }}>
-        STATUS: {status}
+        style={{ fontFamily: C.mono, fontSize: '0.72rem', padding: '0.6rem 0.8rem', margin: '0.9rem 0', border: `1px solid ${isErr ? C.red : C.hair}`, color: isErr ? C.red : C.dim, cursor: wrongChain ? 'pointer' : 'default', wordBreak: 'break-word' }}>
+        {status}
       </div>
 
-      {/* ---------- REGIME + THE TWO SCORES ---------- */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
+      {/* ---------------- DATA SOURCE BANNER ---------------- */}
+      <div style={{ ...panel, marginBottom: '1rem', borderColor: m?.live ? C.green : C.amber, display: 'flex', gap: '1rem', alignItems: 'baseline', flexWrap: 'wrap' }}>
+        <span style={{ fontFamily: C.mono, fontWeight: 700, color: m?.live ? C.green : C.amber }}>
+          {!engineUp ? '● ENGINE OFFLINE' : m?.live ? '● LIVE MARKET DATA' : '● HISTORICAL REPLAY'}
+        </span>
+        <span style={{ ...plain, flex: 1, minWidth: '300px' }}>
+          {!engineUp ? 'The risk engine is not running. Start the dev server with npm run dev.'
+            : m?.live ? <>Real {m.symbol} prices, streaming from the public Binance API right now — one new bar every minute. Nobody chose this data.</>
+            : <>Recorded {m?.symbol} prices from {m?.window_from?.slice(0, 10)}, played back at {m?.replay_speed}× speed. Real market history, not a simulation.</>}
+        </span>
+        {t && <span style={{ fontFamily: C.mono, fontSize: '1.1rem' }}>{usd(t.close)}</span>}
+      </div>
+
+      {/* ---------------- THE ANSWER ---------------- */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
         <div style={{ ...panel, borderColor: isRedlined ? C.red : C.green, borderWidth: 2 }}>
-          <div style={label}>Vault regime (on-chain)</div>
-          <div style={{ fontFamily: C.mono, fontSize: '2rem', fontWeight: 700, color: isRedlined ? C.red : C.green, lineHeight: 1.3 }}>
-            {mode === undefined ? '—' : isRedlined ? 'REDLINED' : 'CALM'}
+          <div style={label}>What is happening to your money</div>
+          <div style={{ fontFamily: C.mono, fontSize: '2.2rem', fontWeight: 700, color: isRedlined ? C.red : C.green, lineHeight: 1.25, margin: '0.3rem 0' }}>
+            {mode === undefined ? '—' : isRedlined ? 'MOVED TO SAFETY' : 'IN THE VAULT'}
           </div>
-          <div style={{ ...label, textTransform: 'none', color: C.dim }}>
-            {isRedlined ? 'Deposits blocked. Funds moved to bunker accounting.' : 'Deposits open. Funds at risk in the vault.'}
+          <div style={plain}>
+            {isRedlined
+              ? 'The alarm fired. Every deposit was moved into the bunker and new deposits are blocked. You can still withdraw.'
+              : 'The market looks normal, so deposits are open and funds sit in the vault. If a crash starts, they move automatically.'}
           </div>
         </div>
 
-        <div style={panel}>
-          <div style={label}>Redline score — computed (engine, 1 Hz)</div>
-          <div style={{ fontFamily: C.mono, fontSize: '2.6rem', fontWeight: 700, color: (t?.score ?? 0) >= THRESHOLD ? C.red : C.text, lineHeight: 1.1 }}>
-            {t?.score !== undefined ? num(t.score, 2) : '—'}<span style={{ fontSize: '1rem', color: C.dim }}> / 100</span>
+        <div style={{ ...panel, borderColor: b.color }}>
+          <div style={label}>Market risk right now</div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.8rem', margin: '0.3rem 0' }}>
+            <span style={{ fontFamily: C.mono, fontSize: '2.6rem', fontWeight: 700, color: b.color, lineHeight: 1 }}>
+              {liveScore !== undefined ? num(liveScore, 1) : '—'}
+            </span>
+            <span style={{ fontFamily: C.mono, fontSize: '1rem', color: C.dim }}>/ 100</span>
+            <span style={{ fontFamily: C.mono, fontWeight: 700, color: b.color }}>{b.word}</span>
           </div>
-          <div style={{ ...label, textTransform: 'none' }}>{engineUp ? `Off-chain. Bar ${t?.time ?? ''}` : 'ENGINE OFFLINE — run risk_engine.py'}</div>
-        </div>
-
-        <div style={panel}>
-          <div style={label}>Redline score — attested (on-chain)</div>
-          <div style={{ fontFamily: C.mono, fontSize: '2.6rem', fontWeight: 700, color: Number(onChainScore ?? 0) >= THRESHOLD ? C.red : C.text, lineHeight: 1.1 }}>
-            {onChainScore !== undefined ? String(onChainScore) : '—'}<span style={{ fontSize: '1rem', color: C.dim }}> / 100</span>
+          <div style={{ position: 'relative', height: '0.9rem', border: `1px solid ${C.hair}`, marginBottom: '0.5rem' }}>
+            <div style={{ position: 'absolute', inset: '0 auto 0 0', width: `${Math.min(liveScore ?? 0, 100)}%`, background: b.color }} />
+            <div style={{ position: 'absolute', left: `${TH}%`, top: -4, bottom: -4, width: 2, background: C.red }} />
           </div>
-          <div style={{ ...label, textTransform: 'none' }}>
-            Integer, written by the oracle · age {scoreAge === null ? '—' : `${scoreAge} s`}
-          </div>
+          <div style={plain}>{b.says} The alarm line is {TH}: below it nothing happens, at or above it the vault can act.</div>
         </div>
       </div>
 
-      {/* ---------- CHART ---------- */}
-      <div style={{ ...panel, marginBottom: '1rem' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.6rem' }}>
-          <div>
-            <span style={{ fontFamily: C.mono, fontSize: '1rem', fontWeight: 700 }}>{m?.symbol ?? 'ETH/USDT'}</span>
-            <span style={{ ...label, marginLeft: '0.8rem' }}>{m ? `${m.source} · replay ${m.replay_speed}×` : 'engine offline'}</span>
-          </div>
-          {t && (
-            <div style={{ fontFamily: C.mono, fontSize: '0.9rem' }}>
-              {usd(t.close)}
-              <span style={{ color: t.change_pct < 0 ? C.red : C.green, marginLeft: '0.7rem' }}>
-                {pct(t.change_pct)} since window open{m ? ` (${usd(m.open_price)})` : ''}
-              </span>
+      {/* ---------------- THE TWO CHECKS ---------------- */}
+      <div style={{ ...panel, marginBottom: '1rem', borderColor: key1 && key2 ? C.red : C.hair }}>
+        <h2 style={{ fontSize: '0.95rem', margin: '0 0 0.3rem' }}>Two independent checks must agree</h2>
+        <div style={{ ...plain, marginBottom: '0.9rem' }}>
+          Anyone in the world can press the alarm button — but the contract only lets it work when
+          two different methods, which look at the data in completely different ways, both say danger.
+          One bad minute is not enough to move your money.
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
+          {[
+            { name: 'Check 1 — Stress meter', val: `${chainScore ?? '—'} of ${TH} needed`, ok: key1,
+              how: 'Adds up how wildly the price swings, how hard it is falling, and how much extra trading there is.' },
+            { name: 'Check 2 — Regime model', val: `${P_TURB === undefined ? '—' : num(P_TURB * 100, 1) + '%'} of ${num(P_GATE * 100, 0)}% needed`, ok: key2,
+              how: 'Estimates the chance the market has flipped into a "stressed" state and stays there. Calculated by the contract itself.' },
+            { name: 'Result', val: key1 && key2 ? 'ALARM CAN RING' : 'ALARM BLOCKED', ok: key1 && key2,
+              how: 'Both checks, plus the data must be less than 2 minutes old.' },
+          ].map((x) => (
+            <div key={x.name} style={{ border: `1px solid ${x.ok ? C.red : C.hair}`, padding: '0.8rem' }}>
+              <div style={label}>{x.name}</div>
+              <div style={{ fontFamily: C.mono, fontSize: '1rem', fontWeight: 700, color: x.ok ? C.red : C.dim, margin: '0.35rem 0' }}>
+                {x.ok ? '✓' : '○'} {x.val}
+              </div>
+              <div style={{ ...plain, fontSize: '0.75rem' }}>{x.how}</div>
             </div>
-          )}
-        </div>
-        <Chart history={feed?.history ?? []} threshold={THRESHOLD} />
-        <div style={{ ...label, marginTop: '0.5rem', textTransform: 'none' }}>
-          Top: ETH price in USD. Bottom: Redline score 0–100 with the threshold line at {THRESHOLD}.
-          Dashed vertical = first breach. Price and volume are the only inputs; nothing else feeds the score.
+          ))}
         </div>
       </div>
 
-      {/* ---------- SCORE BREAKDOWN ---------- */}
-      <div style={{ ...panel, marginBottom: '1rem', overflowX: 'auto' }}>
-        <h2 style={{ fontSize: '0.95rem', margin: '0 0 0.2rem' }}>How this score is built</h2>
-        <div style={{ ...label, textTransform: 'none', marginBottom: '0.8rem' }}>
-          Each factor is measured in its own real units, mapped to 0–100, multiplied by its weight.
-          The three point values sum to the score — there is no hidden term.
-        </div>
-        <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: C.mono, fontSize: '0.8rem' }}>
-          <thead>
-            <tr style={{ ...label, textAlign: 'left' }}>
-              {['Factor', 'Raw measurement', 'Std devs', '0–100', '× Weight', '= Points'].map((h) => (
-                <th key={h} style={{ ...cell, ...label, borderBottom: `1px solid ${C.border}` }}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr key={r.k}>
-                <td style={cell}>
-                  {r.k}
-                  <div style={{ ...label, textTransform: 'none', fontSize: '0.62rem' }}>{r.sub}</div>
-                </td>
-                <td style={{ ...cell, whiteSpace: 'normal' }}>{r.raw}</td>
-                <td style={{ ...cell, color: C.dim }}>{r.z}</td>
-                <td style={cell}>{num(r.n, 1)}</td>
-                <td style={{ ...cell, color: C.dim }}>{num(r.w, 2)}</td>
-                <td style={{ ...cell, fontWeight: 700 }}>{num(r.p, 2)}</td>
-              </tr>
-            ))}
-            {t && (
-              <tr>
-                <td style={{ ...cell, fontWeight: 700, borderBottom: 'none' }} colSpan={5}>REDLINE SCORE</td>
-                <td style={{ ...cell, fontWeight: 700, borderBottom: 'none', color: t.score >= THRESHOLD ? C.red : C.text }}>
-                  {num(t.score, 2)}
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-        {m && (
-          <div style={{ ...label, textTransform: 'none', marginTop: '0.8rem', lineHeight: 1.6 }}>
-            Normalization: a z-score of 0 → 0 points, {m.z_span}σ or more → 100. Volume {1}× mean → 0,
-            {' '}{1 + m.shock_span}× or more → 100. Both clamped, so a calm market reads 0 rather than negative.
-            Z-scores use a rolling {m.windows.z}-bar baseline ({(m.windows.z / 60).toFixed(0)} h), long enough that a
-            crash does not quietly raise its own mean. Weights are fixed constants, not fitted.
-          </div>
-        )}
-      </div>
-
-      {/* ---------- PROVENANCE + LATENCY + VAULT ---------- */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1.15fr 1fr', gap: '1rem' }}>
+      {/* ---------------- CHART + MONEY ---------------- */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1.5fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
         <div style={panel}>
-          <h2 style={{ fontSize: '0.95rem', margin: '0 0 0.7rem' }}>Data provenance</h2>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: C.mono, fontSize: '0.76rem' }}>
+          <h2 style={{ fontSize: '0.95rem', margin: '0 0 0.3rem' }}>Price and risk over time</h2>
+          <div style={{ ...plain, marginBottom: '0.6rem' }}>
+            Top line: the {m?.symbol ?? 'ETH'} price in US dollars. Bottom: the risk score, with the red alarm line.
+          </div>
+          <Chart history={feed?.history ?? []} threshold={TH} />
+        </div>
+
+        <div style={panel}>
+          <h2 style={{ fontSize: '0.95rem', margin: '0 0 0.3rem' }}>Your money</h2>
+          <div style={{ ...plain, marginBottom: '0.9rem' }}>
+            <strong>Depositing</strong> puts test coins into the vault so you can watch the circuit breaker
+            protect them. This is <strong>test-network MON — it is not real money and has no value.</strong>{' '}
+            You can withdraw everything at any time, in either state.
+          </div>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: C.mono, fontSize: '0.82rem' }}>
             <tbody>
               {[
-                ['Asset', m?.symbol ?? '—'],
-                ['Quote currency', m?.quote ?? '—'],
-                ['Source', m ? `${m.source} (${m.interval})` : '—'],
-                ['File', m ? `${m.file} — ${m.file_bars.toLocaleString('en-US')} bars` : '—'],
-                ['File covers', m ? `${m.file_from} → ${m.file_to}` : '—'],
-                ['Replay window', m ? `${m.window_from} → ${m.window_to}` : '—'],
-                ['Window length', m ? `${m.window_bars} bars (${(m.window_bars / 60).toFixed(0)} h) at ${m.replay_speed}× speed` : '—'],
-                ['Price move', t && m ? `${usd(m.open_price)} → ${usd(t.close)}  (${pct(t.change_pct)})` : '—'],
-                ['Event', 'LUNA / UST collapse, 12 May 2022'],
-                ['Nature', 'Real historical market data. Replayed, not simulated.'],
-              ].map(([k, v]) => (
-                <tr key={k}>
-                  <td style={{ ...cell, ...label, width: '38%' }}>{k}</td>
-                  <td style={{ ...cell, whiteSpace: 'normal' }}>{v}</td>
+                ['Your deposit', myBal, C.text, 'Yours. Withdrawable any time.'],
+                ['In the vault', vaultBal, C.text, 'Everyone’s funds, exposed while calm.'],
+                ['In the bunker', bunkerBal, isRedlined ? C.red : C.dim, 'Everyone’s funds, after the alarm.'],
+              ].map(([k, v, col, sub]) => (
+                <tr key={k as string}>
+                  <td style={{ ...cell, width: '55%' }}>
+                    <span style={label}>{k as string}</span>
+                    <div style={{ ...plain, fontSize: '0.68rem' }}>{sub as string}</div>
+                  </td>
+                  <td style={{ ...cell, textAlign: 'right', color: col as string, fontSize: '1rem' }}>
+                    {v !== undefined ? num(Number(formatEther(v as bigint)), 4) : '—'} MON
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          <div style={{ ...label, textTransform: 'none', marginTop: '0.8rem', lineHeight: 1.6, color: C.red }}>
-            Unit boundary: the risk signal is measured on ETH/USDT in US dollars.
-            The vault holds MON on Monad testnet. Testnet MON has no monetary value; ETH is the
-            risk proxy, not the deposited asset.
-          </div>
-        </div>
 
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', minWidth: 0 }}>
-          {/* LATENCY */}
-          <div style={panel}>
-            <h2 style={{ fontSize: '0.95rem', margin: '0 0 0.7rem' }}>Measured on-chain latency</h2>
-            <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap' }}>
-              <div>
-                <div style={{ fontFamily: C.mono, fontSize: '2.2rem', fontWeight: 700, color: C.green }}>
-                  {o?.redline_ms ?? o?.post_ms ?? '—'}<span style={{ fontSize: '0.9rem', color: C.dim }}> ms</span>
-                </div>
-                <div style={label}>
-                  {o?.redline_ms ? 'redline() send → receipt' : 'postScore() send → receipt'}
-                  {o?.method ? ` · ${o.redline_method ?? o.method}` : ''}
-                </div>
-              </div>
-              <div>
-                <div style={{ fontFamily: C.mono, fontSize: '2.2rem', fontWeight: 700 }}>
-                  {scoreAge === null ? '—' : scoreAge}<span style={{ fontSize: '0.9rem', color: C.dim }}> s</span>
-                </div>
-                <div style={label}>Age of the attested score</div>
-              </div>
-            </div>
-            <div style={{ ...label, textTransform: 'none', marginTop: '0.7rem', lineHeight: 1.6 }}>
-              Left is wall-clock time from transaction send to receipt, measured by the oracle using Monad's
-              <code style={{ margin: '0 4px', fontSize: '0.7rem', border: 'none', background: 'transparent', color: C.text }}>eth_sendRawTransactionSync</code>.
-              Right is staleness, not speed.
-            </div>
-            {o?.redline_tx && (
-              <a href={`${EXPLORER}/tx/${o.redline_tx}`} target="_blank" rel="noreferrer"
-                style={{ ...label, color: C.red, display: 'block', marginTop: '0.6rem' }}>
-                VIEW REDLINE TRANSACTION ON MONADSCAN →
-              </a>
-            )}
-          </div>
-
-          {/* VAULT */}
-          <div style={{ ...panel, flex: 1 }}>
-            <h2 style={{ fontSize: '0.95rem', margin: '0 0 0.7rem' }}>Vault — Monad testnet MON</h2>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: C.mono, fontSize: '0.82rem' }}>
-              <tbody>
-                {[
-                  ['Vault (at risk)', vaultBal, C.text, 'Spendable, exposed while CALM'],
-                  ['Bunker (sheltered)', bunkerBal, isRedlined ? C.red : C.dim, 'Moved here on redline'],
-                  ['Your position', myBal, C.text, 'Withdrawable in either mode'],
-                ].map(([k, v, col, sub]) => (
-                  <tr key={k as string}>
-                    <td style={{ ...cell, ...label, width: '52%' }}>
-                      {k as string}
-                      <div style={{ ...label, textTransform: 'none', fontSize: '0.62rem' }}>{sub as string}</div>
-                    </td>
-                    <td style={{ ...cell, textAlign: 'right', color: col as string, fontSize: '1rem' }}>
-                      {v !== undefined ? num(Number(formatEther(v as bigint)), 4) : '—'} MON
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-
-            <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
-              <input type="number" min="0" step="0.01" placeholder="0.00" value={amount}
-                onChange={(e) => setAmount(e.target.value)} disabled={isRedlined || !isConnected}
-                style={{ flex: 1, minWidth: 0, background: 'transparent', border: `1px solid ${C.border}`, color: C.text, padding: '0.7rem', fontFamily: C.mono }} />
-              <button onClick={() => send('deposit', { value: parseEther(amount || '0') })}
-                disabled={isRedlined || !isConnected || !Number(amount) || isPending}
-                style={{ padding: '0.7rem 1rem', background: isRedlined || !Number(amount) ? C.panel : C.text, color: isRedlined || !Number(amount) ? C.dim : C.bg, border: 'none', fontWeight: 700, fontFamily: C.sans, cursor: 'pointer' }}>
-                DEPOSIT MON
-              </button>
-            </div>
-            <button onClick={() => send('withdraw')} disabled={!isConnected || !myBal || isPending}
-              style={{ width: '100%', marginTop: '0.5rem', padding: '0.7rem', background: 'transparent', color: C.text, border: `1px solid ${C.border}`, fontWeight: 700, fontFamily: C.sans, cursor: 'pointer' }}>
-              WITHDRAW MY FULL POSITION
+          <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
+            <input type="number" min="0" step="0.01" placeholder="0.00" value={amount}
+              onChange={(e) => setAmount(e.target.value)} disabled={isRedlined || !isConnected}
+              style={{ flex: 1, minWidth: 0, background: 'transparent', border: `1px solid ${C.border}`, color: C.text, padding: '0.7rem', fontFamily: C.mono }} />
+            <button onClick={() => send('deposit', { value: parseEther(amount || '0') })}
+              disabled={isRedlined || !isConnected || !Number(amount) || isPending}
+              style={{ padding: '0.7rem 1rem', background: isRedlined || !Number(amount) ? C.panel : C.text, color: isRedlined || !Number(amount) ? C.dim : C.bg, border: 'none', fontWeight: 700, fontFamily: C.sans, cursor: 'pointer' }}>
+              DEPOSIT
             </button>
-            <div style={{ ...label, textTransform: 'none', marginTop: '0.5rem' }}>
-              {!isConnected ? 'Connect a wallet to move funds.'
-                : isRedlined ? 'Deposits blocked while REDLINED. Withdrawals still work.'
-                : 'Deposits are native MON from your connected wallet.'}
-            </div>
-
-            <div style={{ height: 1, background: '#2A2A28', margin: '1rem 0' }} />
-
-            <button onClick={() => send('redline')}
-              disabled={!isConnected || isRedlined || Number(onChainScore ?? 0) < THRESHOLD || isPending}
-              style={{ width: '100%', padding: '0.85rem', background: 'transparent', color: C.red, border: `1px solid ${C.red}`, fontWeight: 700, fontFamily: C.sans, cursor: 'pointer' }}>
-              PULL THE ALARM — redline()
-            </button>
-            <div style={{ ...label, textTransform: 'none', marginTop: '0.5rem' }}>
-              Callable by anyone. The contract only allows it while the attested score
-              ({String(onChainScore ?? '—')}) is at or above {THRESHOLD}.
-              {isRedlined && ' Already redlined.'}
-            </div>
-
-            {isOracle && (
-              <button onClick={() => send('setMode', { args: [isRedlined ? 0 : 1] })} disabled={isPending}
-                style={{ width: '100%', marginTop: '0.9rem', padding: '0.5rem', background: C.panel, color: C.dim, border: `1px dashed ${C.border}`, fontFamily: C.sans, fontSize: '0.72rem', cursor: 'pointer' }}>
-                [ORACLE ONLY] {isRedlined ? 'RESET TO CALM' : 'FORCE REDLINE'} — demo control
-              </button>
-            )}
           </div>
+          <button onClick={() => send('withdraw')} disabled={!isConnected || myMon === 0 || isPending}
+            style={{ width: '100%', marginTop: '0.5rem', padding: '0.7rem', background: 'transparent', color: C.text, border: `1px solid ${C.border}`, fontWeight: 700, fontFamily: C.sans, cursor: 'pointer' }}>
+            WITHDRAW MY {num(myMon, 4)} MON
+          </button>
+          <div style={{ ...plain, fontSize: '0.75rem', marginTop: '0.5rem' }}>
+            {!isConnected ? 'Connect a wallet first.'
+              : isRedlined ? 'New deposits are blocked while the alarm is on. Withdrawing still works.'
+              : myMon === 0 ? 'Nothing deposited yet.' : 'Withdraw returns your full balance in one transaction.'}
+          </div>
+
+          <div style={{ height: 1, background: C.hair, margin: '1rem 0' }} />
+          <button onClick={() => send('redline')} disabled={!isConnected || isRedlined || !key1 || !key2 || isPending}
+            style={{ width: '100%', padding: '0.85rem', background: 'transparent', color: key1 && key2 ? C.red : C.dim, border: `1px solid ${key1 && key2 ? C.red : C.hair}`, fontWeight: 700, fontFamily: C.sans, cursor: 'pointer' }}>
+            PRESS THE ALARM
+          </button>
+          <div style={{ ...plain, fontSize: '0.75rem', marginTop: '0.5rem' }}>
+            {isRedlined ? 'Already fired.'
+              : !key1 && !key2 ? 'Blocked: neither check sees danger.'
+              : !key1 ? 'Blocked: the regime model agrees, the stress meter does not.'
+              : !key2 ? 'Blocked: the stress meter is over the line, the regime model does not confirm.'
+              : 'Both checks agree. Anyone can fire it now.'}
+          </div>
+
+          {isOracle && (
+            <button onClick={() => send('setMode', { args: [isRedlined ? 0 : 1] })} disabled={isPending}
+              style={{ width: '100%', marginTop: '0.9rem', padding: '0.5rem', background: C.panel, color: C.dim, border: `1px dashed ${C.hair}`, fontFamily: C.sans, fontSize: '0.72rem', cursor: 'pointer' }}>
+              [operator] {isRedlined ? 'Reset to calm' : 'Force the alarm'} — demo control
+            </button>
+          )}
         </div>
       </div>
 
-      <footer style={{ ...label, textTransform: 'none', marginTop: '1.2rem', paddingTop: '0.8rem', borderTop: `1px solid #2A2A28`, lineHeight: 1.7 }}>
-        Deterministic math decides, AI only narrates — the Math Firewall. Score computed off-chain from price
-        and volume alone, attested on-chain by oracle {oracleAddr ? `${oracleAddr.slice(0, 6)}…${oracleAddr.slice(-4)}` : '—'}.
-        Vault <a href={`${EXPLORER}/address/${CONTRACT_ADDRESS}`} target="_blank" rel="noreferrer" style={{ color: C.text }}>{CONTRACT_ADDRESS}</a> on MonadScan.
+      {/* ---------------- DETAILS: nothing hidden, just folded ---------------- */}
+      <div style={panel}>
+        <details>
+          <summary style={summary}>▸ How the risk score is calculated (every number)</summary>
+          <div style={{ ...plain, margin: '0.5rem 0 0.9rem' }}>
+            Three measurements, each converted to a 0–100 scale and given a fixed weight.
+            The three point values add up to the score exactly — nothing else is involved.
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: C.mono, fontSize: '0.78rem' }}>
+              <thead><tr>{['What we measure', 'Actual reading', 'How unusual', '0–100', '× Weight', '= Points'].map((h) => (
+                <th key={h} style={{ ...cell, ...label, borderBottom: `1px solid ${C.border}`, textAlign: 'left' }}>{h}</th>))}</tr></thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.k}>
+                    <td style={cell}>{r.k}<div style={{ ...plain, fontSize: '0.65rem' }}>{r.tech}</div></td>
+                    <td style={{ ...cell, whiteSpace: 'nowrap' }}>{r.raw}</td>
+                    <td style={{ ...cell, color: C.dim }}>{r.z}</td>
+                    <td style={cell}>{num(r.n, 1)}</td>
+                    <td style={{ ...cell, color: C.dim }}>{num(r.w, 2)}</td>
+                    <td style={{ ...cell, fontWeight: 700 }}>{num(r.p, 2)}</td>
+                  </tr>
+                ))}
+                {t && <tr><td style={{ ...cell, fontWeight: 700 }} colSpan={5}>TOTAL RISK SCORE</td>
+                  <td style={{ ...cell, fontWeight: 700, color: b.color }}>{num(t.score, 2)}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+          {m && (
+            <div style={{ ...plain, fontSize: '0.75rem', marginTop: '0.8rem' }}>
+              “How unusual” is a z-score: how many standard deviations above the average of the last{' '}
+              {m.windows.z} minutes ({(m.windows.z / 60).toFixed(0)} hours). {m.z_span}σ or more scores 100.
+              Volume is a plain ratio instead: {1 + m.shock_span}× normal or more scores 100. Both are clamped,
+              so a calm market reads 0 rather than a negative number. The weights are fixed constants, not fitted to any crash.
+            </div>
+          )}
+        </details>
+
+        <details>
+          <summary style={summary}>▸ Why there are two risk numbers, and why they differ</summary>
+          <div style={{ ...plain, margin: '0.5rem 0' }}>
+            They are the <strong>same measurement at two points in the pipeline</strong>, not two different opinions.
+            <ul style={{ margin: '0.6rem 0', paddingLeft: '1.2rem' }}>
+              <li><strong>{liveScore !== undefined ? num(liveScore, 2) : '—'} — measured now.</strong> The engine on this machine recomputes it from the newest bar. It has decimals and updates every second.</li>
+              <li><strong>{chainScore ?? '—'} — recorded on the blockchain.</strong> The oracle sends the measurement to the contract, which stores it as a whole number. This is the value that controls the money, because it is the only one the contract can see.</li>
+            </ul>
+            The gap between them is the time it takes to write to the chain — right now{' '}
+            <strong>{lag === null ? '—' : `${lag} seconds`}</strong> since the last write. The decimals disappear
+            because the contract stores whole numbers. If the two ever drift far apart, the oracle has stopped
+            and the contract refuses to act on data older than 2 minutes.
+          </div>
+        </details>
+
+        <details>
+          <summary style={summary}>▸ Where the data comes from</summary>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: C.mono, fontSize: '0.75rem', marginTop: '0.5rem' }}>
+            <tbody>
+              {[
+                ['Mode', m?.live ? 'LIVE — streaming right now' : 'REPLAY — recorded history'],
+                ['Asset', m?.symbol ?? '—'],
+                ['Priced in', m?.quote ?? '—'],
+                ['Source', m?.source ?? '—'],
+                ['Bar size', m?.interval ?? '—'],
+                ['Bars in view', m ? `${m.window_bars} (${(m.window_bars / 60).toFixed(0)} h)` : '—'],
+                ['Covering', m ? `${m.window_from} → ${m.window_to}` : '—'],
+                ...(m?.live ? [] : [['Replayed at', m ? `${m.replay_speed}× real time` : '—'],
+                                    ['Event', 'LUNA / UST collapse, 12 May 2022'],
+                                    ['File', m ? `${m.file} — ${m.file_bars.toLocaleString('en-US')} bars` : '—']]),
+              ].map(([k, v]) => (
+                <tr key={k as string}><td style={{ ...cell, ...label, width: '30%' }}>{k}</td>
+                  <td style={{ ...cell, whiteSpace: 'normal' }}>{v}</td></tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ ...plain, fontSize: '0.75rem', marginTop: '0.8rem', color: C.amber }}>
+            Two different currencies are on this page on purpose. The risk is measured on <strong>ETH priced in
+            US dollars</strong>, because that is where a real crash shows up. The vault holds <strong>MON on Monad
+            testnet</strong>, which is play money. ETH is the risk signal; MON is what the demo protects.
+          </div>
+        </details>
+
+        <details>
+          <summary style={summary}>▸ Speed, and proof on the blockchain</summary>
+          <div style={{ display: 'flex', gap: '2rem', flexWrap: 'wrap', margin: '0.7rem 0' }}>
+            <div>
+              <div style={{ fontFamily: C.mono, fontSize: '2rem', fontWeight: 700, color: C.green }}>
+                {o?.redline_ms ?? o?.post_ms ?? '—'}<span style={{ fontSize: '0.9rem', color: C.dim }}> ms</span>
+              </div>
+              <div style={label}>{o?.redline_ms ? 'alarm transaction' : 'last data update'} · {o?.redline_method ?? o?.method ?? '—'}</div>
+            </div>
+            <div>
+              <div style={{ fontFamily: C.mono, fontSize: '2rem', fontWeight: 700 }}>{lag ?? '—'}<span style={{ fontSize: '0.9rem', color: C.dim }}> s</span></div>
+              <div style={label}>since the chain was updated</div>
+            </div>
+            <div>
+              <div style={{ fontFamily: C.mono, fontSize: '2rem', fontWeight: 700 }}>{String(bars ?? 0)}</div>
+              <div style={label}>bars the contract has processed</div>
+            </div>
+          </div>
+          <div style={{ ...plain, fontSize: '0.75rem' }}>
+            The first number is real wall-clock time from sending the transaction to holding its receipt, measured
+            by the oracle. It is speed. The second is how long ago the chain was last updated — that is staleness,
+            not speed. Two different things, so they get two different boxes.
+          </div>
+          <div style={{ marginTop: '0.7rem' }}>
+            {o?.redline_tx && <a href={`${EXPLORER}/tx/${o.redline_tx}`} target="_blank" rel="noreferrer" style={{ ...label, color: C.red, display: 'block' }}>See the alarm transaction on MonadScan →</a>}
+            <a href={`${EXPLORER}/address/${CONTRACT_ADDRESS}`} target="_blank" rel="noreferrer" style={{ ...label, color: C.text, display: 'block', marginTop: '0.3rem' }}>See the vault contract on MonadScan →</a>
+          </div>
+        </details>
+
+        <details>
+          <summary style={summary}>▸ Plain-English glossary</summary>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem', marginTop: '0.5rem' }}>
+            <tbody>
+              {[
+                ['Vault', 'Where deposits sit while the market is normal.'],
+                ['Bunker', 'Where deposits are moved when the alarm fires. Same contract, separate accounting.'],
+                ['Redline / the alarm', 'The moment the vault decides conditions are dangerous and shelters the funds.'],
+                ['Oracle', 'The program that reads the market and reports it to the contract. It reports raw readings, not decisions.'],
+                ['Regime', 'Whether the market is in a “calm” or a “stressed” mood. Markets tend to stay in one for a while.'],
+                ['Volatility', 'How much the price jumps around. High volatility means large moves in both directions.'],
+                ['Log return', 'The price change over one minute, written so that gains and losses are symmetric.'],
+                ['z-score (σ)', 'How far from normal something is. 0 is average, 3σ is very rare.'],
+                ['Testnet MON', 'Play-money coins on Monad’s test network. They cannot be sold and are worth nothing.'],
+              ].map(([k, v]) => (
+                <tr key={k}><td style={{ ...cell, width: '22%', fontFamily: C.sans, fontWeight: 700 }}>{k}</td>
+                  <td style={{ ...cell, fontFamily: C.sans, whiteSpace: 'normal', color: '#C8C8C2' }}>{v}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
+      </div>
+
+      <footer style={{ ...plain, fontSize: '0.75rem', marginTop: '1.2rem', paddingTop: '0.8rem', borderTop: `1px solid ${C.hair}` }}>
+        Deterministic math decides, AI only narrates — the Math Firewall. Risk measured from price and volume alone;
+        the regime model runs inside the contract. Data reported by {oracleAddr ? `${oracleAddr.slice(0, 6)}…${oracleAddr.slice(-4)}` : '—'}.
       </footer>
     </div>
   );

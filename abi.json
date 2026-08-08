@@ -5,6 +5,16 @@
         "internalType": "int256",
         "name": "_redlineThreshold",
         "type": "int256"
+      },
+      {
+        "internalType": "int256",
+        "name": "_regimeThreshold",
+        "type": "int256"
+      },
+      {
+        "internalType": "int256[8]",
+        "name": "hmm",
+        "type": "int256[8]"
       }
     ],
     "stateMutability": "nonpayable",
@@ -60,6 +70,31 @@
       {
         "indexed": false,
         "internalType": "int256",
+        "name": "logReturn",
+        "type": "int256"
+      },
+      {
+        "indexed": false,
+        "internalType": "int256",
+        "name": "regimeProb",
+        "type": "int256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "RegimeUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "int256",
         "name": "score",
         "type": "int256"
       },
@@ -72,6 +107,123 @@
     ],
     "name": "ScoreUpdated",
     "type": "event"
+  },
+  {
+    "inputs": [],
+    "name": "A01",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "A11",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "INV_CALM",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "INV_TURB",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "LN_SIGMA_RATIO",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "MU_CALM",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "MU_TURB",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "P0",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "barsProcessed",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
   },
   {
     "inputs": [],
@@ -91,7 +243,7 @@
     "name": "currentMode",
     "outputs": [
       {
-        "internalType": "enum RedlineVault.Mode",
+        "internalType": "enum RegimeVault.Mode",
         "name": "",
         "type": "uint8"
       }
@@ -149,13 +301,24 @@
     "inputs": [
       {
         "internalType": "int256",
-        "name": "_score0to100",
+        "name": "p",
+        "type": "int256"
+      },
+      {
+        "internalType": "int256",
+        "name": "r",
         "type": "int256"
       }
     ],
-    "name": "postScore",
-    "outputs": [],
-    "stateMutability": "nonpayable",
+    "name": "previewStep",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
     "type": "function"
   },
   {
@@ -179,6 +342,32 @@
     "type": "function"
   },
   {
+    "inputs": [],
+    "name": "regimeProb",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "regimeThreshold",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "",
+        "type": "int256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
     "inputs": [
       {
         "internalType": "uint8",
@@ -187,6 +376,24 @@
       }
     ],
     "name": "setMode",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "int256",
+        "name": "score0to100",
+        "type": "int256"
+      },
+      {
+        "internalType": "int256",
+        "name": "logReturnWad",
+        "type": "int256"
+      }
+    ],
+    "name": "tick",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
