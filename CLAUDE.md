@@ -38,7 +38,9 @@ ALL code, comments, UI copy, commit messages and README in English.
   write a full handoff and I will /clear.
 
 ## Current deployed address
-(update after each deploy)
+0x87DC5BfDA1A74B4fc5270c445444176cf900Bbc6 (Monad testnet, threshold 70,
+oracle 0x3f23D28Ef119C32bfcc998583c0EA89d6A5C9a21)
+Redeploy with `python engine/deploy.py` — it prints the .env lines.
 
 ## Brand kit
 Name: REDLINE. Terminal / trading-desk aesthetic.

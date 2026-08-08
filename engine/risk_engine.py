@@ -32,6 +32,15 @@ SHOCK_SPAN = 3.0           # excess volume ratio mapping to 100 (= 4x mean volum
 
 REDLINE_THRESHOLD = 70     # must match RedlineVault's constructor argument
 
+# Crypto trades 24/7, so a year is 365 * 24 * 60 one-minute bars.
+MINUTES_PER_YEAR = 525_600
+ANNUALIZE = MINUTES_PER_YEAR ** 0.5   # ~725x, scales per-bar sigma to annual
+
+# What the dataset actually is. Shown verbatim in the UI — no vague "market data".
+SYMBOL = "ETH/USDT"
+SOURCE = "Binance spot, 1-minute klines"
+QUOTE = "USDT (1 USDT ~ 1 USD)"
+
 REPLAY_SPEED = 60          # minutes of market time per second of wall clock
 PRE_ROLL_BARS = 90         # calm bars replayed before the worst bar in the file
 MAX_TICKS = 240            # length of the replay window
@@ -42,6 +51,7 @@ PORT = 8000
 ROOT = Path(__file__).resolve().parent.parent
 CSV_PATH = ROOT / "data" / "crash.csv"
 EVENTS_PATH = ROOT / "events.jsonl"
+STATUS_PATH = ROOT / "oracle_status.json"   # written by oracle.py, served to the UI
 
 # Binance 1m kline export, no header row.
 COLUMNS = [
@@ -118,6 +128,77 @@ def pick_start(df):
 
 CURRENT = {"status": "warming up"}
 HISTORY = deque(maxlen=HISTORY_LEN)
+META = {}
+
+
+def utc(ms):
+    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ms / 1000))
+
+
+def describe(df, window):
+    """Everything the UI needs to state its own provenance, no hardcoded strings."""
+    return {
+        "symbol": SYMBOL,
+        "source": SOURCE,
+        "quote": QUOTE,
+        "interval": "1m",
+        "file": str(CSV_PATH.relative_to(ROOT)),
+        "file_bars": len(df),
+        "file_from": utc(df.close_time.iloc[0]),
+        "file_to": utc(df.close_time.iloc[-1]),
+        "window_bars": len(window),
+        "window_from": utc(window.close_time.iloc[0]),
+        "window_to": utc(window.close_time.iloc[-1]),
+        "open_price": round(window.close.iloc[0], 2),
+        "replay_speed": REPLAY_SPEED,
+        "threshold": REDLINE_THRESHOLD,
+        "weights": {
+            "volatility": W_VOLATILITY,
+            "neg_return": W_NEG_RETURN,
+            "volume_shock": W_VOLUME_SHOCK,
+        },
+        "windows": {"vol": VOL_WINDOW, "z": Z_WINDOW, "volume": VOLUME_WINDOW},
+        "z_span": Z_SPAN,
+        "shock_span": SHOCK_SPAN,
+    }
+
+
+def build_tick(bar, open_price):
+    """One replay bar -> the full audit trail behind its score.
+
+    raw    = what was measured, in real units
+    norm   = that measurement mapped to 0..100
+    points = norm * weight, i.e. what it contributed to the score. Points sum
+             to the score exactly, so the number on screen is never a mystery.
+    """
+    norm = {
+        "volatility": round(bar.c_volatility, 2),
+        "neg_return": round(bar.c_neg_return, 2),
+        "volume_shock": round(bar.c_volume_shock, 2),
+    }
+    return {
+        "close_time": int(bar.close_time),
+        "time": utc(bar.close_time),
+        "close": round(bar.close, 2),
+        "change_pct": round((bar.close / open_price - 1) * 100, 2),
+        "volume": round(bar.volume, 2),
+        "score": round(bar.score, 2),
+        "mode": "REDLINED" if bar.score >= REDLINE_THRESHOLD else "CALM",
+        "components": norm,
+        "raw": {
+            "log_return_pct": round(bar.log_return * 100, 3),
+            "sigma_pct_per_min": round(bar.volatility * 100, 3),
+            "sigma_pct_annual": round(bar.volatility * ANNUALIZE * 100, 1),
+            "volume_ratio": round(bar.volume_shock, 2),
+            "z_volatility": round(bar.z_volatility, 2),
+            "z_neg_return": round(bar.z_neg_return, 2),
+        },
+        "points": {
+            "volatility": round(W_VOLATILITY * norm["volatility"], 2),
+            "neg_return": round(W_NEG_RETURN * norm["neg_return"], 2),
+            "volume_shock": round(W_VOLUME_SHOCK * norm["volume_shock"], 2),
+        },
+    }
 
 
 def replay(df):
@@ -125,21 +206,13 @@ def replay(df):
     window = df.iloc[start:start + MAX_TICKS]
     print(f"replaying bars {start}..{start + len(window)} at {REPLAY_SPEED}x")
 
-    global CURRENT
+    global CURRENT, META
+    META = describe(df, window)
+    open_price = window.close.iloc[0]
+
     with EVENTS_PATH.open("a", encoding="utf-8") as events:
         for bar in window.itertuples():
-            tick = {
-                "close_time": int(bar.close_time),
-                "close": round(bar.close, 4),
-                "volume": round(bar.volume, 4),
-                "score": round(bar.score, 2),
-                "mode": "REDLINED" if bar.score >= REDLINE_THRESHOLD else "CALM",
-                "components": {
-                    "volatility": round(bar.c_volatility, 2),
-                    "neg_return": round(bar.c_neg_return, 2),
-                    "volume_shock": round(bar.c_volume_shock, 2),
-                },
-            }
+            tick = build_tick(bar, open_price)
             CURRENT = tick
             HISTORY.append(tick)
             events.write(json.dumps(tick) + "\n")
@@ -153,6 +226,16 @@ def replay(df):
 # --- HTTP -------------------------------------------------------------------
 
 
+def read_oracle_status():
+    """Latency the oracle actually measured. ponytail: a file, not a socket —
+    two processes, one machine, one direction. Use a queue if it ever grows.
+    """
+    try:
+        return json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 class Handler(BaseHTTPRequestHandler):
     # ponytail: one endpoint, path ignored. Split it when the frontend needs
     # two different payload shapes.
@@ -160,6 +243,8 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps({
             **CURRENT,
             "threshold": REDLINE_THRESHOLD,
+            "meta": META,
+            "oracle": read_oracle_status(),
             "history": list(HISTORY),
         }).encode()
         self.send_response(200)

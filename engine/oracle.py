@@ -20,6 +20,8 @@ THRESHOLD = 70.0
 
 ROOT = Path(__file__).resolve().parent.parent
 EVENTS_PATH = ROOT / "events.jsonl"
+STATUS_PATH = ROOT / "oracle_status.json"   # read back by risk_engine's HTTP endpoint
+EXPLORER = "https://testnet.monadscan.com"
 
 # Minimal ABI for oracle operations
 ABI = [
@@ -58,7 +60,11 @@ def require(name, length=None):
 
 
 def send_monad_tx(w3, fn, account, nonce, gas_buffer=1.075):
-    """Build, sign and send via Monad's sync RPC, falling back to standard send."""
+    """Build, sign and send via Monad's sync RPC, falling back to standard send.
+
+    Returns (elapsed_ms, method, tx_hash). elapsed_ms is wall clock from send to
+    receipt — the number the demo puts on screen, so it must be honest.
+    """
     tx = fn.build_transaction({
         "chainId": CHAIN_ID,
         "from": account.address,
@@ -68,17 +74,22 @@ def send_monad_tx(w3, fn, account, nonce, gas_buffer=1.075):
 
     signed = account.sign_transaction(tx)
     raw = signed.raw_transaction
+    tx_hash = w3.to_hex(w3.keccak(raw))  # same hash on either path
 
     start = time.time()
     try:
         response = w3.provider.make_request("eth_sendRawTransactionSync", [w3.to_hex(raw)])
         if "error" in response:
             raise RuntimeError(response["error"])
-        return int((time.time() - start) * 1000), "SYNC"
+        return int((time.time() - start) * 1000), "SYNC", tx_hash
     except Exception:
-        tx_hash = w3.eth.send_raw_transaction(raw)
-        w3.eth.wait_for_transaction_receipt(tx_hash)
-        return int((time.time() - start) * 1000), "ASYNC"
+        w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(raw))
+        return int((time.time() - start) * 1000), "ASYNC", tx_hash
+
+
+def publish(**fields):
+    """Hand the measured latency to risk_engine's HTTP endpoint for the UI."""
+    STATUS_PATH.write_text(json.dumps(fields), encoding="utf-8")
 
 
 def run_oracle():
@@ -88,7 +99,17 @@ def run_oracle():
 
     w3 = Web3(Web3.HTTPProvider(RPC_URL))
     account = w3.eth.account.from_key(private_key)
-    contract = w3.eth.contract(address=w3.to_checksum_address(contract_address), abi=ABI)
+    address = w3.to_checksum_address(contract_address)
+
+    # A call to an address with no code is a valid no-op tx: it "succeeds", costs
+    # gas and does nothing. Refuse to run rather than fake a working demo.
+    if not w3.eth.get_code(address):
+        raise SystemExit(
+            f"No contract deployed at {address} on {RPC_URL}.\n"
+            "Deploy RedlineVault with Remix -> Injected Provider (MetaMask), not the Remix VM."
+        )
+
+    contract = w3.eth.contract(address=address, abi=ABI)
 
     print(f">>> CONNECTED TO MONAD TESTNET: {w3.is_connected()}")
     print(f">>> ORACLE ADDRESS: {account.address}")
@@ -118,17 +139,20 @@ def run_oracle():
 
         print(f"\n[{event['close_time']}] Score: {score} | Pushing on-chain...")
         try:
-            ms, method = send_monad_tx(w3, contract.functions.postScore(score), account, nonce)
+            ms, method, tx = send_monad_tx(w3, contract.functions.postScore(score), account, nonce)
             print(f"OK postScore() landed in {ms}ms ({method})")
             nonce += 1
             last_score = score
+            status = {"post_ms": ms, "method": method, "post_tx": tx, "score": score}
+            publish(**status)
 
             if score >= THRESHOLD and not redline_triggered:
                 print("THRESHOLD BREACHED. TRIGGERING REDLINE()...")
-                ms, method = send_monad_tx(w3, contract.functions.redline(), account, nonce)
+                ms, method, tx = send_monad_tx(w3, contract.functions.redline(), account, nonce)
                 print(f"VAULT REDLINED IN {ms}ms ({method})")
                 redline_triggered = True
                 nonce += 1
+                publish(**status, redline_ms=ms, redline_tx=tx, redline_method=method)
         except Exception as e:
             print(f"TX FAILED: {str(e)[:200]}")
             nonce = w3.eth.get_transaction_count(account.address)  # resync after a drop
