@@ -6,11 +6,6 @@
 ![Network](https://img.shields.io/badge/Network-Monad_Testnet-836EF9?style=flat-square)
 ![Reaction Time](https://img.shields.io/badge/Reaction_Time-417ms-FF2D2D?style=flat-square)
 ![Custody Tests](https://img.shields.io/badge/Custody_Tests-27%2F27_Passing-brightgreen?style=flat-square)
-![Solidity](https://img.shields.io/badge/Solidity-363636?style=flat-square&logo=solidity&logoColor=white)
-![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)
-![React](https://img.shields.io/badge/React-61DAFB?style=flat-square&logo=react&logoColor=black)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)
-![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-000000?style=flat-square)
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/4972adc7-767b-4da8-8b8b-ba38f517485c" />
 
